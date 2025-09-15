@@ -1,0 +1,13 @@
+# Dependencies
+node_modules/
+
+# Environment/Secrets
+.env
+
+# Local certs
+localhost.pem
+localhost-key.pem
+
+# OS/Editor
+.DS_Store
+*.log

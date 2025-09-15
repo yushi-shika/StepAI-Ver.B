@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+    <title>Realtime Voice Chat</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'/%3E">
+    <style>
+      * { box-sizing: border-box; }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        background: #ffffff;
+        color: #111;
+        margin: 0;
+        padding: 24px;
+      }
+      .container { max-width: 720px; margin: 0 auto; }
+      header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+      #currentTime { font-variant-numeric: tabular-nums; color: #555; }
+      .live-indicator { display: flex; align-items: center; gap: 8px; color: #e11; opacity: 0; transition: opacity .2s; }
+      .live-indicator.active { opacity: 1; }
+      .live-dot { width: 8px; height: 8px; background: #e11; border-radius: 999px; }
+      .controls { display: flex; gap: 12px; align-items: center; margin: 12px 0 16px; }
+      button { border: 1px solid #ddd; background: #fff; color: #111; padding: 10px 14px; border-radius: 8px; cursor: pointer; }
+      button:hover { background: #f6f6f6; }
+      .mic-button { font-size: 18px; }
+      .mic-button.recording { border-color: #0a0; box-shadow: 0 0 0 2px #e7fbe7 inset; }
+      .transcript-area { border: 1px solid #e5e5e5; background: #fafafa; border-radius: 10px; padding: 12px; min-height: 120px; }
+      .transcript-content { font-size: 16px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; color: #222; }
+      .status-text { color: #555; margin-top: 8px; }
+      .volume-control { margin-top: 8px; }
+      .waveform { display: none; }
+      audio { display: none; }
+      .prompt-area { margin: 16px 0; }
+      .prompt-area label { display: block; font-size: 14px; color: #444; margin-bottom: 6px; }
+      .prompt-area textarea { width: 100%; min-height: 96px; font-family: inherit; font-size: 14px; padding: 10px; border: 1px solid #ddd; border-radius: 8px; background: #fff; color: #111; }
+      .prompt-actions { margin-top: 8px; display: flex; gap: 8px; }
+      .voice-area { margin: 8px 0 16px; display: flex; gap: 8px; align-items: center; }
+      .voice-area select, .voice-area input { border: 1px solid #ddd; background: #fff; color: #111; padding: 8px 10px; border-radius: 8px; }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <div id="currentTime">--:--</div>
+        <div class="live-indicator" id="liveIndicator">
+          <div class="live-dot"></div>
+          <span>Live</span>
+        </div>
+      </header>
+
+      <div class="transcript-area">
+        <div class="transcript-content" id="transcript">マイクを許可して、話しかけてください。</div>
+      </div>
+
+      <div class="prompt-area">
+        <label for="instructions">システムプロンプト（AIへの指示）</label>
+        <textarea id="instructions">あなたは丁寧で簡潔な日本語の音声アシスタントです。
+ユーザーが話し終えたら、要点を1〜2文で返答してください。
+難しい専門用語は噛み砕いて説明し、確認が必要なときは1つだけ質問します。
+冗長な前置きやフィラー（えー、あのー等）は使わず、自然で聞き取りやすい速度で話します。
+ユーザーが英語で話した場合は英語で、そうでなければ日本語で応答してください。
+正確性が重要な固有名詞・数値は復唱し、聞き取れない場合は丁寧に聞き返してください。</textarea>
+        <div class="prompt-actions">
+          <button id="applyPrompt">適用</button>
+        </div>
+      </div>
+
+      <div class="controls">
+        <button class="mic-button" id="micButton">🎤 話す</button>
+        <button id="holdButton" title="Hold">⏸ 一時停止</button>
+        <button id="endButton" title="End">✖ 終了</button>
+      </div>
+
+      <div class="status-text" id="status">Ready to connect</div>
+
+      <div class="voice-area">
+        <label for="voiceId">ElevenLabs Voice:</label>
+        <select id="voiceId"></select>
+      </div>
+
+      <div class="volume-control" id="volumeControl">
+        <label>音量 <input type="range" id="volume" min="0" max="1" step="0.01" value="1"></label>
+      </div>
+    </div>
+
+    <audio id="ai" autoplay></audio>
+    <script src="./app.js" type="module"></script>
+  </body>
+  </html>
