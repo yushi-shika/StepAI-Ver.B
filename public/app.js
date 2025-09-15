@@ -6,9 +6,7 @@ let isRecording = false;
 let aiBuffer = '';
 // Track prompt status (informational only)
 let promptApplied = false;
-// Simple TTS queue
-const ttsQueue = [];
-let ttsPlaying = false;
+// No external TTS; audio is received from OpenAI over WebRTC
 
 const els = {
   micButton: document.getElementById('micButton'),
@@ -24,7 +22,6 @@ const els = {
   instructions: document.getElementById('instructions'),
   applyPrompt: document.getElementById('applyPrompt'),
   voice: document.getElementById('voice'),
-  voiceId: document.getElementById('voiceId'),
 };
 
 function updateClock() {
@@ -45,36 +42,22 @@ console.log('Elements found:', {
   transcript: !!els.transcript
 });
 
-// Preload ElevenLabs voices and persist selection
-(async () => {
+function ensureAudioPlayback() {
   try {
-    const stored = localStorage.getItem('elevenlabsVoiceId');
-    const r = await fetch('/voices');
-    if (r.ok) {
-      const j = await r.json();
-      const voices = j?.voices || [];
-      if (els.voiceId && els.voiceId.tagName === 'SELECT') {
-        els.voiceId.innerHTML = '';
-        for (const v of voices) {
-          const opt = document.createElement('option');
-          opt.value = v.id;
-          opt.textContent = `${v.name} (${v.id.slice(0,6)}…)`;
-          els.voiceId.appendChild(opt);
-        }
-        if (stored && voices.find(v => v.id === stored)) els.voiceId.value = stored;
-        if (!els.voiceId.value && voices[0]) els.voiceId.value = voices[0].id;
-      } else if (els.voiceId) {
-        // Fallback if still an input: set default
-        if (!els.voiceId.value) els.voiceId.value = stored || (voices[0]?.id || '');
-      }
+    if (!els.audio) return;
+    els.audio.muted = false;
+    if (els.volume) {
+      const v = parseFloat(els.volume.value || '1');
+      if (!Number.isNaN(v)) els.audio.volume = v;
+    } else {
+      els.audio.volume = 1;
     }
+    const p = els.audio.play();
+    if (p && typeof p.then === 'function') p.catch(() => {});
   } catch {}
-  if (els.voiceId) {
-    els.voiceId.addEventListener('change', () => {
-      try { localStorage.setItem('elevenlabsVoiceId', els.voiceId.value); } catch {}
-    });
-  }
-})();
+}
+
+// No ElevenLabs voice preloading required
 
 function setStatus(s) {
   els.status.textContent = s;
@@ -98,7 +81,6 @@ function appendTranscript(text) {
 function flushAiSubtitle(prefix = 'AI: ') {
   const text = aiBuffer.trim();
   if (text) appendTranscript(`${prefix}${text}\n`);
-  if (text) enqueueTts(text, (els.voiceId?.value || '').trim());
   aiBuffer = '';
 }
 
@@ -177,7 +159,7 @@ async function connect() {
   setStatus('fetching session…');
   let sess;
   try {
-    const body = { modalities: ['text', 'audio'] }; // allow audio input for STT
+    const body = { modalities: ['text', 'audio'], voice: (els.voice?.value || 'alloy').trim() };
     if (els.instructions && els.instructions.value.trim()) {
       body.instructions = els.instructions.value.trim();
     }
@@ -189,17 +171,20 @@ async function connect() {
     if (!r.ok) {
       const t = await r.text().catch(() => '');
       setStatus(`/session ${r.status}: ${t?.slice(0,120) || 'error'}`);
-      return cleanup();
+      cleanup();
+      throw new Error(`Session request failed: ${r.status}`);
     }
     sess = await r.json();
   } catch (err) {
     console.error('Session fetch error:', err);
     setStatus('failed to reach /session');
-    return cleanup();
+    cleanup();
+    throw err;
   }
   if (!sess?.client_secret) {
     setStatus('invalid session response');
-    return cleanup();
+    cleanup();
+    throw new Error('Invalid session response');
   }
 
   const model = sess.model;
@@ -211,22 +196,35 @@ async function connect() {
   });
 
   // Send mic track to the model (kept disabled until promptApplied).
-  // Force transceiver direction to 'sendonly' so we do NOT receive OpenAI audio.
+  // Allow bidirectional audio so we can receive OpenAI audio responses.
   micStream.getAudioTracks().forEach(t => {
     const sender = pc.addTrack(t, micStream);
     try {
       const trx = pc.getTransceivers().find(tr => tr.sender === sender);
-      if (trx) trx.direction = 'sendonly';
+      if (trx) trx.direction = 'sendrecv';
     } catch {}
   });
 
-  // Ensure we can receive AI audio even if no track arrives immediately (Safari, some browsers)
-  // We delegate audio TTS to ElevenLabs, so no recvonly transceiver is required
-  // try { pc.addTransceiver('audio', { direction: 'recvonly' }); } catch {}
+  // Ensure we can receive AI audio even if no track arrives immediately
+  try { pc.addTransceiver('audio', { direction: 'recvonly' }); } catch {}
 
-  // Ignore any remote audio tracks from OpenAI (we synthesize via ElevenLabs)
-  pc.ontrack = (_event) => {
-    // Intentionally no-op
+  // Attach remote audio from OpenAI to the audio element
+  pc.ontrack = (event) => {
+    const streamsLen = (event.streams && event.streams.length) || 0;
+    console.log('pc.ontrack: received remote track', { streams: streamsLen, kind: event.track?.kind });
+    try {
+      const stream = streamsLen ? event.streams[0] : new MediaStream([event.track]);
+      els.audio.srcObject = stream;
+      try {
+        const t = stream.getAudioTracks && stream.getAudioTracks()[0];
+        if (t) {
+          console.log('remote audio track:', { enabled: t.enabled, muted: t.muted, readyState: t.readyState });
+          t.onunmute = () => { console.log('remote audio track: unmuted'); ensureAudioPlayback(); };
+          t.onended = () => console.log('remote audio track: ended');
+        }
+      } catch {}
+      ensureAudioPlayback();
+    } catch {}
   };
 
   // Data channel for events (subtitles)
@@ -235,6 +233,14 @@ async function connect() {
       const msg = JSON.parse(data);
       if (msg?.type === 'response.created') {
         aiBuffer = '';
+      } else if (msg?.type === 'input_audio_buffer.committed') {
+        // When VAD commits a user turn, ask the model to respond with audio
+        if (dc && dc.readyState === 'open') {
+          try {
+            dc.send(JSON.stringify({ type: 'response.create', response: { conversation: 'auto', modalities: ['audio','text'] } }));
+            console.debug('sent: response.create (on committed)');
+          } catch (e) { console.warn('failed to send response.create', e); }
+        }
       } else if (msg?.type === 'response.output_text.delta') {
         aiBuffer += (msg.delta || '');
       } else if (msg?.type === 'response.audio_transcript.delta') {
@@ -250,7 +256,9 @@ async function connect() {
         promptApplied = true;
         setStatus('Prompt applied');
       } else if (msg?.type === 'error' || msg?.type === 'response.error') {
-        console.error('Realtime error event:', msg);
+        try { console.error('Realtime error event:', JSON.stringify(msg)); } catch { console.error('Realtime error event:', msg); }
+      } else if (msg?.type === 'output_audio_buffer.started') {
+        ensureAudioPlayback();
       } else {
         // Minimal debug for unknown realtime events to help diagnose STT
         if (msg?.type) console.log('oai event:', msg.type);
@@ -265,16 +273,18 @@ async function connect() {
     ch.onopen = () => {
       console.log('dc.onopen readyState=', ch.readyState);
       const text = (els.instructions?.value || '').trim();
+      const voice = (els.voice?.value || 'alloy').trim();
       if (text) {
         try {
-          ch.send(JSON.stringify({ type: 'session.update', session: { instructions: text } }));
+          ch.send(JSON.stringify({ type: 'session.update', session: { instructions: text, voice } }));
           console.debug('sent: session.update');
         } catch {}
+      } else if (voice) {
+        try {
+          ch.send(JSON.stringify({ type: 'session.update', session: { voice } }));
+          console.debug('sent: session.update (voice)');
+        } catch {}
       }
-      try {
-        ch.send(JSON.stringify({ type: 'response.create', response: { conversation: 'default', modalities: ['text'] } }));
-        console.debug('sent: response.create');
-      } catch {}
       updateUI('recording');
       setStatus('Listening...');
     };
@@ -294,8 +304,11 @@ async function connect() {
   pc.onconnectionstatechange = () => {
     console.log('pc.connectionState:', pc.connectionState);
     setStatus(pc.connectionState);
-    if (pc.connectionState === 'failed' || pc.connectionState === 'closed' || pc.connectionState === 'disconnected') {
+    if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
       cleanup();
+    } else if (pc.connectionState === 'disconnected') {
+      // 'disconnected' is temporary, don't cleanup immediately
+      setStatus('Connection temporarily lost, attempting to reconnect...');
     }
   };
   pc.onsignalingstatechange = () => console.log('pc.signalingState:', pc.signalingState);
@@ -340,13 +353,14 @@ async function connect() {
       setStatus('SDP exchange failed');
       console.error('SDP exchange error:', errText);
       cleanup();
-      return;
+      throw new Error(`SDP exchange failed: ${sdpResponse.status}`);
     }
     answer = await sdpResponse.text();
   } catch (err) {
     console.error('SDP exchange network error:', err);
     setStatus('SDP exchange network error');
-    return cleanup();
+    cleanup();
+    throw err;
   }
   await pc.setRemoteDescription({ type: 'answer', sdp: answer });
   console.debug('Remote SDP applied');
@@ -455,52 +469,4 @@ if (els.applyPrompt) {
   });
 }
 
-// TTS: queue and playback via ElevenLabs proxy
-function enqueueTts(text, voiceId) {
-  ttsQueue.push({ text, voiceId: (voiceId || '') });
-  if (!ttsPlaying) playNextTts();
-}
-
-async function playNextTts() {
-  if (ttsPlaying) return;
-  const item = ttsQueue.shift();
-  if (!item) return;
-  const { text, voiceId } = item;
-  ttsPlaying = true;
-  try {
-    const r = await fetch('/tts', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      // Let server choose voice from ELEVENLABS_VOICE_ID (env) unless explicitly provided here
-      body: JSON.stringify(voiceId ? { text, voiceId } : { text })
-    });
-    if (!r.ok) {
-      console.warn('TTS request failed', r.status);
-    } else {
-      const buf = await r.arrayBuffer();
-      const blob = new Blob([buf], { type: 'audio/mpeg' });
-      const url = URL.createObjectURL(blob);
-      try { els.audio.pause(); } catch {}
-      els.audio.src = url;
-      await els.audio.play().catch(() => {});
-      await new Promise((resolve) => {
-        const onEnd = () => { els.audio.removeEventListener('ended', onEnd); resolve(); };
-        els.audio.addEventListener('ended', onEnd);
-      });
-      URL.revokeObjectURL(url);
-    }
-  } catch (e) {
-    console.error('TTS playback error:', e);
-  } finally {
-    ttsPlaying = false;
-    if (ttsQueue.length) playNextTts();
-  }
-}
-
-// Stop TTS on disconnect/end
-function stopTts() {
-  try { els.audio.pause(); } catch {}
-  try { els.audio.currentTime = 0; } catch {}
-  ttsQueue.length = 0;
-  ttsPlaying = false;
-}
+// No external TTS functions

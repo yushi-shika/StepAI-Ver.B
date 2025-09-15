@@ -75,8 +75,12 @@
       <div class="status-text" id="status">Ready to connect</div>
 
       <div class="voice-area">
-        <label for="voiceId">ElevenLabs Voice:</label>
-        <select id="voiceId"></select>
+        <label for="voice">ボイス:</label>
+        <select id="voice">
+          <option value="alloy">alloy（落ち着き）</option>
+          <option value="verse">verse（明るめ）</option>
+          <option value="aria">aria（やわらか）</option>
+        </select>
       </div>
 
       <div class="volume-control" id="volumeControl">
@@ -84,7 +88,7 @@
       </div>
     </div>
 
-    <audio id="ai" autoplay></audio>
+    <audio id="ai" autoplay playsinline></audio>
     <script src="./app.js" type="module"></script>
   </body>
   </html>

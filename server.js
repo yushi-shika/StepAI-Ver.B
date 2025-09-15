@@ -5,7 +5,6 @@ import { fileURLToPath } from 'url';
 import https from 'https';
 import fs from 'fs';
 import { Readable } from 'stream';
-import crypto from 'crypto';
 
 dotenv.config();
 
@@ -20,15 +19,11 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 // Use gpt-realtime by default, allow override via env
 const REALTIME_MODEL = (process.env.REALTIME_MODEL || 'gpt-realtime').trim();
 const DEFAULT_VOICE = process.env.VOICE || 'alloy';
-const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || '';
-const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || '';
 
 console.log('[DEBUG] Environment variables:');
 console.log('  OPENAI_API_KEY:', OPENAI_API_KEY ? `${OPENAI_API_KEY.slice(0, 8)}...${OPENAI_API_KEY.slice(-4)}` : 'NOT SET');
 console.log('  REALTIME_MODEL:', REALTIME_MODEL);
 console.log('  DEFAULT_VOICE:', DEFAULT_VOICE);
-console.log('  ELEVENLABS_API_KEY:', ELEVENLABS_API_KEY ? 'SET' : 'NOT SET');
-console.log('  ELEVENLABS_VOICE_ID:', ELEVENLABS_VOICE_ID || 'NOT SET');
 
 if (!OPENAI_API_KEY) {
   console.warn('[WARN] OPENAI_API_KEY is not set. /session will fail until configured.');
@@ -41,7 +36,8 @@ app.get('/health', (_req, res) => {
 // Issues a short-lived (≈1 min) ephemeral client key for WebRTC.
 app.post('/session', async (req, res) => {
   try {
-    const voice = req.body?.voice || undefined; // voice is ignored when using ElevenLabs for audio
+    console.log('[DEBUG] /session request body:', JSON.stringify(req.body, null, 2));
+    const voice = req.body?.voice || DEFAULT_VOICE;
     const instructions = req.body?.instructions;
     // Allow audio input for STT; we do not set voice so no OpenAI TTS is returned
     const modalities = req.body?.modalities || ['text', 'audio'];
@@ -52,7 +48,7 @@ app.post('/session', async (req, res) => {
       turn_detection: { type: 'server_vad' }
     };
     if (instructions) body.instructions = instructions;
-    // Do not include voice when delegating audio to ElevenLabs
+    if (voice) body.voice = voice;
 
     const r = await fetch('https://api.openai.com/v1/realtime/sessions', {
       method: 'POST',
@@ -66,6 +62,7 @@ app.post('/session', async (req, res) => {
 
     if (!r.ok) {
       const errText = await r.text().catch(() => '');
+      console.log('[DEBUG] OpenAI session creation failed:', r.status, errText);
       return res.status(r.status).json({ error: 'Failed to create realtime session', details: errText });
     }
 
@@ -86,103 +83,7 @@ app.post('/session', async (req, res) => {
   }
 });
 
-// Cache ElevenLabs voices in-memory for a short time to avoid repeated fetches
-let elevenVoicesCache = { at: 0, data: null };
-async function getElevenVoices() {
-  if (!ELEVENLABS_API_KEY) throw new Error('ELEVENLABS_API_KEY not configured');
-  const now = Date.now();
-  if (elevenVoicesCache.data && (now - elevenVoicesCache.at) < 5 * 60 * 1000) {
-    return elevenVoicesCache.data;
-  }
-  const r = await fetch('https://api.elevenlabs.io/v1/voices', {
-    headers: { 'xi-api-key': ELEVENLABS_API_KEY }
-  });
-  if (!r.ok) throw new Error(`ElevenLabs voices error: ${r.status}`);
-  const j = await r.json();
-  elevenVoicesCache = { at: now, data: j };
-  return j;
-}
-
-app.get('/voices', async (_req, res) => {
-  try {
-    if (!ELEVENLABS_API_KEY) return res.status(500).json({ error: 'ELEVENLABS_API_KEY not configured' });
-    const j = await getElevenVoices();
-    const list = (j?.voices || []).map(v => ({ id: v.voice_id, name: v.name }));
-    res.json({ voices: list });
-  } catch (e) {
-    console.error('Error in /voices:', e);
-    res.status(500).json({ error: 'Failed to fetch voices' });
-  }
-});
-
-// Proxy ElevenLabs streaming TTS. Accepts { text, voiceId? }
-app.post('/tts', async (req, res) => {
-  try {
-    if (!ELEVENLABS_API_KEY) {
-      return res.status(500).json({ error: 'ELEVENLABS_API_KEY not configured' });
-    }
-    const text = (req.body?.text || '').toString().trim();
-    if (!text) return res.status(400).json({ error: 'Missing text' });
-    let voiceId = (req.body?.voiceId || ELEVENLABS_VOICE_ID || '').toString();
-    if (!voiceId) {
-      try {
-        const j = await getElevenVoices();
-        voiceId = (j?.voices?.[0]?.voice_id || '').toString();
-      } catch {}
-    }
-    if (!voiceId) return res.status(400).json({ error: 'Missing ElevenLabs voice id (no default available)' });
-
-    const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}/stream?optimize_streaming_latency=3`;
-    const payload = {
-      text,
-      model_id: 'eleven_multilingual_v2',
-      voice_settings: {
-        stability: 0.4,
-        similarity_boost: 0.7,
-        style: 0.55,
-        use_speaker_boost: true
-      }
-    };
-    const r = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'xi-api-key': ELEVENLABS_API_KEY,
-        'Content-Type': 'application/json',
-        'Accept': 'audio/mpeg'
-      },
-      body: JSON.stringify(payload)
-    });
-    if (!r.ok || !r.body) {
-      const errText = await r.text().catch(() => '');
-      return res.status(r.status || 502).json({ error: 'TTS upstream error', details: errText });
-    }
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Cache-Control', 'no-store');
-    // Stream ElevenLabs response to client
-    try {
-      const nodeStream = Readable.fromWeb(r.body);
-      nodeStream.pipe(res);
-    } catch {
-      // Fallback to manual reader
-      const reader = r.body.getReader();
-      const pump = async () => {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          res.write(Buffer.from(value));
-        }
-        res.end();
-      };
-      pump().catch((e) => {
-        console.error('TTS stream error:', e);
-        try { res.end(); } catch {}
-      });
-    }
-  } catch (err) {
-    console.error('Error in /tts:', err);
-    res.status(500).json({ error: 'Internal TTS error' });
-  }
-});
+// ElevenLabs endpoints removed; OpenAI handles output audio
 
 const isHttps = process.env.HTTPS === 'true';
 
